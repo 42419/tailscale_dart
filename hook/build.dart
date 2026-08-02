@@ -20,7 +20,9 @@
 // Platform-specific handling:
 //   - iOS: builds a static archive (c-archive) with Xcode toolchain.
 //   - Android: builds a shared library (c-shared) with NDK toolchain.
-//   - macOS/Linux/Windows: builds a shared library (c-shared) with host toolchain.
+//   - macOS/Linux: builds a shared library (c-shared) with host toolchain.
+//   - Windows: skipped - the Dart data plane is POSIX-only and the package's
+//     `platforms:` list excludes Windows, so no native asset is produced.
 
 import 'dart:io';
 
@@ -43,6 +45,21 @@ void main(List<String> args) async {
     final goarch = _toGOARCH(targetArch);
     final isIOS = targetOS == OS.iOS;
 
+    // Windows is intentionally unsupported (the Dart data plane is
+    // POSIX-only) and the package's `platforms:` list excludes it. Skip the
+    // native build instead of failing so host-side tooling such as
+    // `flutter test` on a Windows machine does not error on a native build
+    // that can never run there. Note this also means the hook produces no
+    // native asset for Windows targets; FFI calls would fail at runtime,
+    // which matches the package's documented platform support.
+    if (targetOS == OS.windows) {
+      stderr.writeln(
+        'tailscale: skipping native build - Windows is not a supported '
+        'platform.',
+      );
+      return;
+    }
+
     // Output filename
     final libName = targetOS.dylibFileName('tailscale');
     final libPath = outDir.resolve(libName).toFilePath();
@@ -50,14 +67,46 @@ void main(List<String> args) async {
     // Go source entry point
     final mainGo = p.join(packageRoot, 'go', 'cmd', 'dylib', 'main.go');
 
-    // Build environment
+    // Build environment. Inherit the parent process environment wholesale -
+    // Go needs GOCACHE, GOPROXY, PATH, etc. to build. Passing only the GO*
+    // overrides (as the previous code did) drops the build cache location and
+    // toolchain environment, so `go build` fails with "build cache is
+    // required, but could not be located: GOCACHE is not defined".
     final env = <String, String>{
+      ...Platform.environment,
       'GOOS': goos,
       'GOARCH': goarch,
       'CGO_ENABLED': '1',
       // Disable raw disco to avoid permission errors on Android/Linux.
       'TS_ENABLE_RAW_DISCO': 'false',
     };
+
+    // Belt-and-suspenders: if the hooks runner stripped even GOCACHE /
+    // LOCALAPPDATA / HOME from this process, derive Go's default build cache
+    // location (mirroring Go's own os.UserCacheDir behavior) so the build
+    // cache requirement is always satisfiable without touching user env vars.
+    if ((env['GOCACHE'] ?? '').trim().isEmpty) {
+      final String? cacheBase;
+      if (Platform.isWindows) {
+        cacheBase = env['LOCALAPPDATA'] ?? env['USERPROFILE'];
+      } else if (Platform.isMacOS) {
+        final home = env['HOME'];
+        cacheBase = (home != null && home.isNotEmpty)
+            ? p.join(home, 'Library', 'Caches')
+            : null;
+      } else {
+        final xdg = env['XDG_CACHE_HOME'];
+        final home = env['HOME'];
+        cacheBase = (xdg != null && xdg.isNotEmpty)
+            ? xdg
+            : (home != null && home.isNotEmpty)
+            ? p.join(home, '.cache')
+            : null;
+      }
+      if (cacheBase != null && cacheBase.isNotEmpty) {
+        env['GOCACHE'] = p.join(cacheBase, 'go-build');
+      }
+    }
 
     // Build flags
     final buildTags = <String>[];

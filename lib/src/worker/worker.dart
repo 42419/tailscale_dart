@@ -161,9 +161,19 @@ final class Worker {
   void _dispose() {
     if (_disposed) return;
     _disposed = true;
-    native.duneStopWatch();
-    native.duneSetDartPort(0);
-    native.duneStop();
+    // Native teardown is best-effort. On hosts where the native library was
+    // never loaded (e.g. Windows, which the package does not support, or a
+    // worker that failed during bootstrap), the FFI symbols cannot be
+    // resolved and these calls would throw an unhandled ArgumentError from
+    // the message handler. Guard them so a failed bootstrap tears down
+    // cleanly instead of surfacing as an unhandled async error.
+    try {
+      native.duneStopWatch();
+      native.duneSetDartPort(0);
+      native.duneStop();
+    } catch (_) {
+      // The native runtime was never started; nothing to tear down.
+    }
     _receivePort.close();
 
     if (!_sendPortCompleter.isCompleted) {
